@@ -1,143 +1,171 @@
 import os
-import requests
 import re
+import time
+import logging
+import requests
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
+# ---------- конфиг ----------
 TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise ValueError("TOKEN не задан — установите переменную окружения TOKEN")
+
+CACHE_TTL = 3600
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------- тарифы ----------
+BANKS = {
+    "Совкомбанк": {
+        "formula": lambda r: r * 0.69,
+        "tariff": (
+            "Ведение счёта — бесплатно\n"
+            "Открытие счёта — 1000 руб. (разово)\n"
+            "Банк-клиент — 1700 руб. (разово)\n"
+            "Платежи юр. лицам — 100 руб.\n"
+            "Платежи физ. лицам — 100 руб. + 0,5% (макс. 3100 руб.)\n"
+            "Доп. счета в день открытия — 1000 руб./шт, позже — бесплатно\n"
+            "Возврат задатков, справки, выписки — бесплатно"
+        ),
+    },
+    "ТКБ":        {"formula": lambda r: r - 4.5,  "tariff": "Тарифы уточняются."},
+    "Альфа-Банк": {"formula": lambda r: r - 3.05, "tariff": "Тарифы уточняются."},
+    "Синара":     {"formula": lambda r: r - 1.9,  "tariff": "Тарифы уточняются."},
+    "Уралсиб":    {"formula": lambda r: r - 4.5,  "tariff": "Тарифы уточняются."},
+}
+
+CALLBACK_TO_BANK = {
+    f"bank_{k.lower().replace('-', '').replace(' ', '')}": k for k in BANKS
+}
+
+# ---------- кеш ставки ----------
+_cache: dict = {"rate": None, "date": None, "ts": 0}
 
 
-# ---------- ЦБ РФ ----------
-def get_key_rate():
-    url = "https://www.cbr.ru/hd_base/KeyRate/"
-    r = requests.get(url, timeout=10)
-    html = r.text
-
-    matches = re.findall(r"(\d{2}\.\d{2}\.\d{4}).*?(\d+,\d+)", html, re.DOTALL)
-    date, rate = matches[-1]
-
-    return float(rate.replace(",", ".")), date
-
-
-# ---------- расчёты ----------
-def calc(rate):
-    return {
-        "Совкомбанк": rate * 0.69,
-        "ТКБ": rate - 4.5,
-        "Альфа-Банк": rate - 3.05,
-        "Синара": rate - 1.9,
-        "Уралсиб": rate - 4.5,
-    }
+def get_key_rate() -> tuple[float, str]:
+    if _cache["rate"] and time.time() - _cache["ts"] < CACHE_TTL:
+        return _cache["rate"], _cache["date"]
+    try:
+        r = requests.get("https://www.cbr.ru/hd_base/KeyRate/", timeout=10)
+        r.raise_for_status()
+        matches = re.findall(r"(\d{2}\.\d{2}\.\d{4}).*?(\d+,\d+)", r.text, re.DOTALL)
+        if not matches:
+            raise ValueError("Ставка не найдена в HTML")
+        date, rate_str = matches[-1]
+        rate = float(rate_str.replace(",", "."))
+        _cache.update({"rate": rate, "date": date, "ts": time.time()})
+        return rate, date
+    except Exception as e:
+        logger.error(f"Ошибка ЦБ: {e}")
+        if _cache["rate"]:
+            logger.warning("Используем кешированную ставку")
+            return _cache["rate"], _cache["date"]
+        raise RuntimeError("Не удалось получить ключевую ставку. Попробуйте позже.")
 
 
-# ---------- таблица ----------
-def build_table(rate, date):
-    data = calc(rate)
+# ---------- экраны ----------
+def screen_main() -> tuple[str, InlineKeyboardMarkup]:
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Ставки",  callback_data="rates")],
+        [InlineKeyboardButton("💰 Тарифы", callback_data="tariffs")],
+    ])
+    return "Выберите раздел:", markup
 
+
+def screen_rates() -> tuple[str, InlineKeyboardMarkup]:
+    rate, date = get_key_rate()
     width = 15
-
     lines = [
         f"Дата: {date}",
         f"Ключевая ставка: {rate:.2f}%",
-        "--------------------------------",
-        ""
+        "─" * 32,
     ]
-
-    for bank, value in data.items():
+    for bank, info in BANKS.items():
+        value = info["formula"](rate)
         lines.append(f"{bank:<{width}} {value:>7.2f}%")
-
-    lines.append("--------------------------------")
-
-    return "\n".join(lines)
-
-
-# ---------- Совкомбанк ----------
-SOVKOM_TEXT = """Совкомбанк — тарифы
-
-Ведение счета – Бесплатно
-Открытие счета – 1000 руб. (разово)
-Банк-клиент – 1700 руб. (разово)
-
-Платежи юридическим лицам – 100 руб.
-Платежи физическим лицам – 100 руб. + 0,5% (но не более 3100 руб.)
-
-Дополнительные счета в день открытия – 1000 руб. за каждый
-Если открытие позже – бесплатно
-
-Возврат задатков – бесплатно
-Справки и выписки – бесплатно
-"""
+    lines.append("─" * 32)
+    text = "\n".join(lines)
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="main")]])
+    return f"<pre>{text}</pre>", markup
 
 
-# ---------- меню ----------
-def menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Ставки", callback_data="banks")],
-        [InlineKeyboardButton("Тарифы", callback_data="tariffs")]
-    ])
+def screen_tariffs() -> tuple[str, InlineKeyboardMarkup]:
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=cb)]
+        for cb, name in CALLBACK_TO_BANK.items()
+    ]
+    buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="main")])
+    return "Выберите банк:", InlineKeyboardMarkup(buttons)
 
 
-def tariffs_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Совкомбанк", callback_data="bank_sovkom")],
-        [InlineKeyboardButton("Уралсиб", callback_data="bank_uralsib")],
-        [InlineKeyboardButton("ТКБ", callback_data="bank_tkb")],
-        [InlineKeyboardButton("Альфа-Банк", callback_data="bank_alfa")],
-        [InlineKeyboardButton("Синара", callback_data="bank_sinara")],
-        [InlineKeyboardButton("Назад", callback_data="back")]
-    ])
-
-
-# ---------- start ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Меню",
-        reply_markup=menu()
+def screen_bank(bank_name: str) -> tuple[str, InlineKeyboardMarkup]:
+    rate, _ = get_key_rate()
+    info = BANKS[bank_name]
+    value = info["formula"](rate)
+    text = (
+        f"🏦 <b>{bank_name}</b>\n"
+        f"{'─' * 32}\n"
+        f"{info['tariff']}\n"
+        f"{'─' * 32}\n"
+        f"Актуальная ставка: <b>{value:.2f}%</b>"
     )
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="tariffs")]])
+    return text, markup
 
 
-# ---------- обработка кнопок ----------
+# ---------- роутер ----------
+SCREENS = {
+    "main":    screen_main,
+    "rates":   screen_rates,
+    "tariffs": screen_tariffs,
+    **{cb: (lambda b: lambda: screen_bank(b))(bank) for cb, bank in CALLBACK_TO_BANK.items()},
+}
+
+
+# ---------- утилита: отправить или отредактировать ----------
+async def render(update: Update, text: str, markup: InlineKeyboardMarkup, parse_mode: str = "HTML"):
+    """Редактирует текущее сообщение или отправляет новое (для /start)."""
+    if update.callback_query:
+        await update.callback_query.message.edit_text(
+            text, reply_markup=markup, parse_mode=parse_mode
+        )
+    else:
+        await update.message.reply_text(
+            text, reply_markup=markup, parse_mode=parse_mode
+        )
+
+
+# ---------- хендлеры ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, markup = screen_main()
+    await render(update, text, markup)
+
+
 async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    rate_value, date = get_key_rate()
-    data = calc(rate_value)
+    screen_fn = SCREENS.get(query.data)
+    if not screen_fn:
+        return
 
-    if query.data == "banks":
-        await query.message.reply_text(build_table(rate_value, date))
+    try:
+        text, markup = screen_fn()
+    except RuntimeError as e:
+        await query.message.edit_text(f"⚠️ {e}")
+        return
 
-    elif query.data == "tariffs":
-        await query.message.reply_text("Выберите банк", reply_markup=tariffs_menu())
-
-    elif query.data == "bank_sovkom":
-        await query.message.reply_text(SOVKOM_TEXT)
-
-    elif query.data == "bank_uralsib":
-        await query.message.reply_text(f"Уралсиб {data['Уралсиб']:.2f}%")
-
-    elif query.data == "bank_tkb":
-        await query.message.reply_text(f"ТКБ {data['ТКБ']:.2f}%")
-
-    elif query.data == "bank_alfa":
-        await query.message.reply_text(f"Альфа-Банк {data['Альфа-Банк']:.2f}%")
-
-    elif query.data == "bank_sinara":
-        await query.message.reply_text(f"Синара {data['Синара']:.2f}%")
-
-    elif query.data == "back":
-        await query.message.reply_text("Меню", reply_markup=menu())
+    await render(update, text, markup)
 
 
 # ---------- запуск ----------
 def main():
     app = Application.builder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handler))
-
-    print("Bot started")
+    logger.info("Bot started")
     app.run_polling()
 
 
