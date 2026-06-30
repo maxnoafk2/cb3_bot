@@ -68,27 +68,25 @@ def get_key_rate() -> tuple[float, str]:
 # ---------- экраны ----------
 def screen_main() -> tuple[str, InlineKeyboardMarkup]:
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Ставки",  callback_data="rates")],
-        [InlineKeyboardButton("💰 Тарифы", callback_data="tariffs")],
+        [InlineKeyboardButton("Ставки", callback_data="rates")],
+        [InlineKeyboardButton("Тарифы", callback_data="tariffs")],
     ])
     return "Выберите раздел:", markup
 
 
 def screen_rates() -> tuple[str, InlineKeyboardMarkup]:
     rate, date = get_key_rate()
-    width = 15
     lines = [
-        f"Дата: {date}",
-        f"Ключевая ставка: {rate:.2f}%",
-        "─" * 32,
+        f"<b>Дата:</b> {date}",
+        f"<b>Ключевая ставка:</b> {rate:.2f}%",
+        "",
     ]
     for bank, info in BANKS.items():
         value = info["formula"](rate)
-        lines.append(f"{bank:<{width}} {value:>7.2f}%")
-    lines.append("─" * 32)
-    text = "\n".join(lines)
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="main")]])
-    return f"<pre>{text}</pre>", markup
+        lines.append(f"<b>{bank}</b> — {value:.2f}%")
+
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main")]])
+    return "\n".join(lines), markup
 
 
 def screen_tariffs() -> tuple[str, InlineKeyboardMarkup]:
@@ -96,7 +94,7 @@ def screen_tariffs() -> tuple[str, InlineKeyboardMarkup]:
         [InlineKeyboardButton(name, callback_data=cb)]
         for cb, name in CALLBACK_TO_BANK.items()
     ]
-    buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="main")])
+    buttons.append([InlineKeyboardButton("Назад", callback_data="main")])
     return "Выберите банк:", InlineKeyboardMarkup(buttons)
 
 
@@ -105,13 +103,13 @@ def screen_bank(bank_name: str) -> tuple[str, InlineKeyboardMarkup]:
     info = BANKS[bank_name]
     value = info["formula"](rate)
     text = (
-        f"🏦 <b>{bank_name}</b>\n"
+        f"<b>{bank_name}</b>\n"
         f"{'─' * 32}\n"
         f"{info['tariff']}\n"
         f"{'─' * 32}\n"
         f"Актуальная ставка: <b>{value:.2f}%</b>"
     )
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="tariffs")]])
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="tariffs")]])
     return text, markup
 
 
@@ -126,7 +124,6 @@ SCREENS = {
 
 # ---------- утилита: отправить или отредактировать ----------
 async def render(update: Update, text: str, markup: InlineKeyboardMarkup, parse_mode: str = "HTML"):
-    """Редактирует текущее сообщение или отправляет новое (для /start)."""
     if update.callback_query:
         await update.callback_query.message.edit_text(
             text, reply_markup=markup, parse_mode=parse_mode
@@ -154,7 +151,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text, markup = screen_fn()
     except RuntimeError as e:
-        await query.message.edit_text(f"⚠️ {e}")
+        await query.message.edit_text(f"Ошибка: {e}")
         return
 
     await render(update, text, markup)
